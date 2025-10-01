@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: click-gateway-1
+    env: node
+    buildCommand: npm install && npx puppeteer browsers install chrome
+    startCommand: node render-deploy.js
+    envVars:
+      - key: INSTANCE_ID
+        value: render-instance-1
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /status
+    autoDeploy: true

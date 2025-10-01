@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Simulador clicks con proxies rotativos (HTML)</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Arial;padding:18px;background:#fff;color:#111}
+  h1{font-size:18px}
+  label{display:inline-block;margin-right:8px}
+  input[type="text"], input[type="number"], textarea {padding:8px;border:1px solid #ccc;border-radius:6px}
+  button{padding:8px 12px;border-radius:6px;border:0;background:#1976d2;color:#fff;cursor:pointer;margin-right:6px}
+  button.warn{background:#d9534f}
+  #ad{display:inline-block;padding:12px 18px;border-radius:8px;border:2px solid #0077cc;background:#eaf6ff;margin-top:10px}
+  #log{margin-top:14px;max-height:320px;overflow:auto;border:1px solid #ddd;padding:8px;background:#fafafa;font-size:13px}
+  .stat{display:inline-block;margin-right:16px;font-weight:600}
+  .small{font-size:13px;color:#444}
+  textarea{width:100%;height:120px}
+</style>
+</head>
+<body>
+  <h1>Simulador de clicks (proxy rotativo por click)</h1>
+  <p class="small">Usar solo contra tu dominio de pruebas: <strong>http://myserverad.test/23adsarewr342</strong></p>
+
+  <div>
+    <label>URL objetivo:</label>
+    <input id="targetUrl" type="text" value="http://myserverad.test/23adsarewr342" style="width:520px"/>
+  </div>
+
+  <div style="margin-top:8px">
+    <label>Objetivo total:</label>
+    <input id="goal" type="number" value="20000" min="1"/>
+    <label style="margin-left:12px">Periodo (horas):</label>
+    <input id="period" type="number" value="24" min="1" style="width:60px"/>
+    <label style="margin-left:12px">Workers (paralelos):</label>
+    <input id="workers" type="number" value="8" min="1" style="width:60px"/>
+  </div>
+
+  <div style="margin-top:8px">
+    <label>Delay medio entre clicks por worker (ms):</label>
+    <input id="delayAvg" type="number" value="3000" min="0" style="width:100px"/>
+    <span class="small" style="margin-left:8px">El script aplicará jitter aleatorio sobre este valor.</span>
+  </div>
+
+  <div style="margin-top:12px">
+    <label><input id="rotateRandom" type="checkbox"/> Selección de proxy aleatoria (en lugar de round-robin)</label>
+  </div>
+
+  <h3 style="margin-top:10px">Proxy gateways (uno por línea)</h3>
+  <!-- 👇 NOTA: agregamos ?x=%URL% para forzar GET -->
+  <textarea id="proxyList">http://localhost:3000/click204?x=%URL%</textarea>
+
+  <div class="small" style="margin-top:6px">
+    <strong>Formato:</strong> Las entradas que contienen <code>%URL%</code> serán llamadas por GET reemplazando la URL destino (codificada). 
+    Las entradas sin <code>%URL%</code> serán llamadas por POST con JSON <code>{ "url": "..."} </code>.
+    <br/>Tus gateways deben permitir CORS. No pongas credenciales sensibles en este HTML.
+  </div>
+
+  <div style="margin-top:12px">
+    <button id="start">Iniciar</button>
+    <button id="stop" class="warn">Detener</button>
+    <button id="reset">Reiniciar contadores</button>
+  </div>
+
+  <div style="margin-top:12px">
+    <span class="stat">Enviados: <span id="sent">0</span></span>
+    <span class="stat">Exitos: <span id="ok">0</span></span>
+    <span class="stat">Errores: <span id="err">0</span></span>
+    <span class="stat">Rate objetivo: <span id="rateGoal">—</span> /min</span>
+    <span class="stat">Clicks/min actual: <span id="curRate">0</span></span>
+    <span class="stat">Proxies: <span id="proxyCount">0</span></span>
+  </div>
+
+  <div style="margin-top:12px">
+    <div id="ad">ELEMENTO DE ANUNCIO (simulado)</div>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+(() => {
+  // elementos UI
+  const targetUrlEl = document.getElementById('targetUrl');
+  const goalEl = document.getElementById('goal');
+  const periodEl = document.getElementById('period');
+  const workersEl = document.getElementById('workers');
+  const delayAvgEl = document.getElementById('delayAvg');
+  const proxyListEl = document.getElementById('proxyList');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const resetBtn = document.getElementById('reset');
+  const sentSpan = document.getElementById('sent');
+  const okSpan = document.getElementById('ok');
+  const errSpan = document.getElementById('err');
+  const rateGoalSpan = document.getElementById('rateGoal');
+  const curRateSpan = document.getElementById('curRate');
+  const proxyCountSpan = document.getElementById('proxyCount');
+  const rotateRandomCheckbox = document.getElementById('rotateRandom');
+  const logBox = document.getElementById('log');
+
+  // estado
+  let state = {
+    running: false,
+    sent: 0,
+    ok: 0,
+    err: 0,
+    workers: [],
+    clicksPerMinuteSchedule: [],
+    minuteIndex: 0,
+    clickTimestamps: [],
+    proxyList: []
+  };
+
+  function log(msg){
+    const el = document.createElement('div');
+    el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logBox.prepend(el);
+    if(logBox.childElementCount > 800) logBox.removeChild(logBox.lastChild);
+  }
+
+  function computeRateGoal(goal, periodHours){
+    const totalMinutes = Math.max(1, Math.floor(periodHours * 60));
+    return { perMinute: Math.ceil(goal / totalMinutes), totalMinutes };
+  }
+
+  function makeVariableSchedule(goal, totalMinutes){
+    const base = Math.floor(goal / totalMinutes);
+    const remainder = goal - base * totalMinutes;
+    const arr = Array(totalMinutes).fill(base);
+    for(let i=0;i<remainder;i++){
+      const idx = Math.floor(Math.random() * totalMinutes);
+      arr[idx] += 1;
+    }
+    for(let i=0;i<totalMinutes;i++){
+      const fudge = Math.round(Math.sin(i/3)*0.5);
+      arr[i] = Math.max(0, arr[i] + fudge);
+    }
+    let sum = arr.reduce((a,b)=>a+b,0);
+    while(sum < goal){ arr[Math.floor(Math.random()*totalMinutes)]++; sum++; }
+    while(sum > goal){
+      const idx = Math.floor(Math.random()*totalMinutes);
+      if(arr[idx] > 0){ arr[idx]--; sum--; }
+    }
+    for(let i=0;i<totalMinutes*2;i++){
+      const a = Math.floor(Math.random()*totalMinutes);
+      const b = Math.floor(Math.random()*totalMinutes);
+      const t = arr[a]; arr[a]=arr[b]; arr[b]=t;
+    }
+    return arr;
+  }
+
+  function parseProxyList(){
+    const raw = proxyListEl.value || '';
+    const lines = raw.split('\n').map(s=>s.trim()).filter(Boolean);
+    return lines;
+  }
+
+  function buildProxyRequest(proxyEntry, targetUrl){
+    if(!proxyEntry) return { url: targetUrl, opts: { method: 'GET', mode: 'cors', cache: 'no-store' } };
+    if(proxyEntry.includes('%URL%')){
+      const url = proxyEntry.replace(/%URL%/g, encodeURIComponent(targetUrl));
+      return { url, opts: { method: 'GET', mode: 'cors', cache: 'no-store' } };
+    } else {
+      return { url: proxyEntry, opts: { method:'POST', headers:{ 'Content-Type':'application/json', 'X-Test-Sim':'1' }, body: JSON.stringify({ url: targetUrl }), mode:'cors', cache:'no-store' } };
+    }
+  }
+
+  async function doOneClick(seq){
+    const targetUrl = targetUrlEl.value.trim();
+    let proxy = null;
+    if(state.proxyList.length > 0){
+      if(rotateRandomCheckbox.checked){
+        proxy = state.proxyList[Math.floor(Math.random()*state.proxyList.length)];
+      } else {
+        proxy = state.proxyList[(seq-1) % state.proxyList.length];
+      }
+    }
+    const { url, opts } = buildProxyRequest(proxy, targetUrl);
+    if(!opts.headers) opts.headers = {};
+    opts.headers['X-Test-Sim'] = '1';
+    const controller = new AbortController();
+    const timeout = setTimeout(()=>controller.abort(), 20000);
+    opts.signal = controller.signal;
+
+    try {
+      const res = await fetch(url, opts);
+      clearTimeout(timeout);
+      if(res.ok){
+        state.ok++; okSpan.textContent = state.ok;
+        state.clickTimestamps.push(Date.now());
+        const twoMinAgo = Date.now() - (2*60*1000);
+        state.clickTimestamps = state.clickTimestamps.filter(t => t >= twoMinAgo);
+        return { ok:true, status: res.status, proxyUsed: proxy || 'DIRECT' };
+      } else {
+        state.err++; errSpan.textContent = state.err;
+        return { ok:false, status: res.status, proxyUsed: proxy || 'DIRECT' };
+      }
+    } catch(e){
+      clearTimeout(timeout);
+      state.err++; errSpan.textContent = state.err;
+      return { ok:false, error: String(e), proxyUsed: proxy || 'DIRECT' };
+    } finally {
+      state.sent++; sentSpan.textContent = state.sent;
+      updateCurrentRateDisplay();
+    }
+  }
+
+  function updateCurrentRateDisplay(){
+    const oneMinAgo = Date.now() - 60*1000;
+    const c = state.clickTimestamps.filter(t => t >= oneMinAgo).length;
+    curRateSpan.textContent = c;
+  }
+
+  function startWorker(workerId){
+    let alive = true;
+    (async () => {
+      while(alive && state.running){
+        const minuteIdx = state.minuteIndex;
+        const quotaThisMinute = state.clicksPerMinuteSchedule[minuteIdx] || 0;
+        const workersCount = parseInt(workersEl.value,10) || 1;
+        const baseForWorker = Math.floor(quotaThisMinute / workersCount);
+        let tasksThisMinute = baseForWorker + (Math.random() < ( (quotaThisMinute % workersCount) / workersCount ) ? 1 : 0);
+        if(Math.random() < 0.05) tasksThisMinute += 1;
+        for(let i=0;i<tasksThisMinute && alive && state.running; i++){
+          const seq = state.sent + 1;
+          const adEl = document.getElementById('ad');
+          adEl.style.transform = 'translateY(-2px)';
+          adEl.style.boxShadow = '0 8px 20px rgba(0,0,0,0.12)';
+          await new Promise(r => setTimeout(r, Math.random()*220 + 60));
+          adEl.style.transform = '';
+          adEl.style.boxShadow = '';
+          const res = await doOneClick(seq);
+          if(!res.ok){
+            log(`Worker ${workerId} seq=${seq} error: ${res.error || res.status} (proxy: ${res.proxyUsed})`);
+          } else {
+            if(seq % 100 === 0) log(`Sent seq=${seq} ok proxy=${res.proxyUsed}`);
+          }
+          const delayAvg = parseInt(delayAvgEl.value,10) || 1000;
+          const jitter = Math.round(delayAvg * (0.5 + Math.random()));
+          await new Promise(r => setTimeout(r, jitter));
+        }
+        await waitUntilNextMinuteTick();
+        state.minuteIndex = (state.minuteIndex + 1) % state.clicksPerMinuteSchedule.length;
+      }
+    })();
+    return () => { alive = false; };
+  }
+
+  let scheduleStartTs = null;
+  async function waitUntilNextMinuteTick(){
+    if(!scheduleStartTs) {
+      const now = Date.now();
+      scheduleStartTs = now - (now % (60*1000));
+    }
+    const now = Date.now();
+    const next = scheduleStartTs + (state.minuteIndex + 1) * 60*1000;
+    const ms = Math.max(50, next - now);
+    await new Promise(r => setTimeout(r, ms));
+  }
+
+  startBtn.addEventListener('click', () => {
+    if(state.running) return;
+    const target = targetUrlEl.value.trim();
+    if(!target){ alert('Ingresá URL objetivo'); return; }
+    const goal = Math.max(1, parseInt(goalEl.value,10) || 20000);
+    const periodHours = Math.max(1, parseFloat(periodEl.value) || 24);
+    const totalMinutes = Math.max(1, Math.floor(periodHours * 60));
+    const sched = makeVariableSchedule(goal, totalMinutes);
+    state.clicksPerMinuteSchedule = sched;
+    state.minuteIndex = 0;
+    state.sent = state.ok = state.err = 0;
+    state.clickTimestamps = [];
+    state.running = true;
+    state.proxyList = parseProxyList();
+    proxyCountSpan.textContent = state.proxyList.length;
+    scheduleStartTs = Date.now() - (Date.now() % (60*1000));
+    const w = Math.max(1, parseInt(workersEl.value,10) || 1);
+    for(let i=0;i<w;i++){
+      const stopFn = startWorker(i+1);
+      state.workers.push(stopFn);
+    }
+    const { perMinute } = computeRateGoal(goal, periodHours);
+    rateGoalSpan.textContent = perMinute;
+    log(`Simulación iniciada: objetivo ${goal} clicks en ${periodHours} h (~${perMinute}/min). Workers=${w}. Proxies=${state.proxyList.length}`);
+    sentSpan.textContent = '0'; okSpan.textContent='0'; errSpan.textContent='0';
+    minuteTicker();
+  });
+
+  async function minuteTicker(){
+    while(state.running){
+      updateCurrentRateDisplay();
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  stopBtn.addEventListener('click', () => {
+    if(!state.running) return;
+    state.running = false;
+    state.workers.forEach(fn => { try{ fn(); }catch(e){} });
+    state.workers = [];
+    log('Simulación detenida por usuario.');
+  });
+
+  resetBtn.addEventListener('click', () => {
+    if(state.running){ alert('Detén la simulación antes de reiniciar.'); return; }
+    state.sent = state.ok = state.err = 0;
+    state.clickTimestamps = [];
+    sentSpan.textContent = '0'; okSpan.textContent='0'; errSpan.textContent='0'; curRateSpan.textContent='0';
+    log('Contadores reiniciados.');
+  });
+
+  window.__simState = state;
+
+  proxyListEl.addEventListener('input', () => {
+    const proxies = parseProxyList();
+    proxyCountSpan.textContent = proxies.length;
+  });
+
+  proxyCountSpan.textContent = parseProxyList().length;
+  const initialGoal = parseInt(goalEl.value,10) || 20000;
+  const initialPeriod = parseFloat(periodEl.value) || 24;
+  rateGoalSpan.textContent = computeRateGoal(initialGoal, initialPeriod).perMinute;
+})();
+</script>
+</body>
+</html>
